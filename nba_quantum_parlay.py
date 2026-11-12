@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from datetime import datetime
 from PIL import Image
 from google import genai
@@ -68,11 +69,9 @@ except ImportError:
 
 @st.cache_data(ttl=15)
 def obtener_pizarra_vivo():
-    """Obtiene los juegos en vivo de la NBA inyectando cabeceras de navegador requeridas por cdn.nba.com"""
     juegos = []
     if NBA_DISPONIBLE:
         try:
-            # Forzar cabeceras HTTP para evitar bloqueos del CDN
             from nba_api.library.http import NBAStatsHTTP
             NBAStatsHTTP.headers.update({
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -89,7 +88,7 @@ def obtener_pizarra_vivo():
         juegos = [
             {
                 "gameId": "0022600001",
-                "gameStatus": 2, # En vivo
+                "gameStatus": 2, 
                 "gameStatusText": "Q3 - 05:42",
                 "period": 3,
                 "gameClock": "PT05M42.00S",
@@ -143,7 +142,6 @@ def obtener_boxscore_vivo(game_id):
         box = boxscore.BoxScore(game_id=game_id)
         return box.game.get_dict()
     except Exception:
-        # Buscar en el fallback simulado si coincide el ID
         for g in obtener_pizarra_vivo():
             if g["gameId"] == game_id:
                 return g
@@ -417,7 +415,7 @@ with tab2:
             if not api_key_input:
                 st.error("Por favor ingresa tu API Key de Gemini en la barra lateral izquierda.")
             else:
-                with st.spinner("Extrayendo estructura y selecciones del ticket..."):
+                with st.spinner("Extrayendo estructura y selecciones del ticket (con reintentos automáticos)..."):
                     try:
                         client = genai.Client(api_key=api_key_input)
                         prompt = """
@@ -448,18 +446,48 @@ with tab2:
                         - Si la cuota total viene en formato americano (ej. +7570), conviértela a decimal (ej. 76.70).
                         Extrae todas las selecciones visibles en la imagen.
                         """
-                        response = client.models.generate_content(
-                            model="gemini-3.8-flash",
-                            contents=[img, prompt],
-                            config={"response_mime_type": "application/json"},
-                        )
-                        data_ticket = json.loads(response.text)
 
-                        st.session_state.extracted_legs = data_ticket.get("legs", [])
-                        st.session_state.extracted_stake = float(data_ticket.get("stake", 10.0))
-                        st.session_state.extracted_cuota = float(data_ticket.get("cuota_total", 2.0))
-                        st.session_state.extracted_nombre = data_ticket.get("nombre_parlay", "Parlay IA")
-                        st.success("¡Extracción completada con éxito! Revisa los datos abajo.")
+                        modelos_cascada = [
+                            "gemini-3.8-flash",
+                            "gemini-3.8-flash-lite",
+                            "gemini-3.8-pro",
+                        ]
+
+                        response = None
+                        modelo_actual = ""
+                        ultimo_error = None
+
+                        for mod in modelos_cascada:
+                            for intento in range(2):
+                                try:
+                                    response = client.models.generate_content(
+                                        model=mod,
+                                        contents=[img, prompt],
+                                        config={"response_mime_type": "application/json"},
+                                    )
+                                    if response and response.text:
+                                        modelo_actual = mod
+                                        break
+                                except Exception as e:
+                                    ultimo_error = e
+                                    if "503" in str(e) or "UNAVAILABLE" in str(e) or "429" in str(e):
+                                        time.sleep(2)
+                                        continue
+                                    else:
+                                        break
+                            if response and response.text:
+                                break
+
+                        if response and response.text:
+                            data_ticket = json.loads(response.text)
+                            st.session_state.extracted_legs = data_ticket.get("legs", [])
+                            st.session_state.extracted_stake = float(data_ticket.get("stake", 10.0))
+                            st.session_state.extracted_cuota = float(data_ticket.get("cuota_total", 2.0))
+                            st.session_state.extracted_nombre = data_ticket.get("nombre_parlay", "Parlay IA")
+                            st.success(f"¡Extracción completada con éxito usando {modelo_actual}! Revisa los datos abajo.")
+                        else:
+                            st.error(f"Los servidores de IA están saturados (Error 503). Detalle: {ultimo_error}")
+
                     except Exception as e:
                         st.error(f"Error procesando la imagen: {e}")
 
