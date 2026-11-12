@@ -1,1 +1,734 @@
+import json
+import os
+import re
+from datetime import datetime
+from nba_api.live.nba.endpoints import boxscore, scoreboard
+from nba_api.stats.endpoints import leaguedashplayerstats, leaguedashteamstats
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from scipy.stats import norm, poisson
+import streamlit as st
+
+# ==========================================
+# CONFIGURACIÓN DE PÁGINA Y ESTADO
+# ==========================================
+st.set_page_config(
+    page_title="NBA Live Parlay & Quant Engine",
+    page_icon="🏀",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+DB_FILE = "mis_parlays_nba.json"
+
+
+def cargar_parlays():
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def guardar_parlays(data):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+
+if "parlays" not in st.session_state:
+    st.session_state.parlays = cargar_parlays()
+
+# ==========================================
+# MOTOR DE EXTRACCIÓN DE DATOS EN VIVO (CDN NBA)
+# ==========================================
+
+
+@st.cache_data(ttl=15)  # Actualización cada 15 segundos para evitar bloqueos
+def obtener_pizarra_vivo():
+    try:
+        board = scoreboard.ScoreBoard()
+        games = board.games.get_dict()
+        return games
+    except Exception as e:
+        st.error(f"Error conectando con el feed en vivo de NBA: {e}")
+        return []
+
+
+@st.cache_data(ttl=15)
+def obtener_boxscore_vivo(game_id):
+    try:
+        box = boxscore.BoxScore(game_id=game_id)
+        return box.game.get_dict()
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600)  # Cache de 1 hora para métricas de temporada
+def obtener_metricas_avanzadas_equipos():
+    try:
+        stats = leaguedashteamstats.LeagueDashTeamStats(
+            measure_type_detailed_defense="Advanced",
+            per_mode_detailed="PerGame",
+            season="2026-27",
+        )
+        df = stats.get_data_frames()[0]
+        return df[
+            [
+                "TEAM_ID",
+                "TEAM_NAME",
+                "GP",
+                "W",
+                "L",
+                "OFF_RATING",
+                "DEF_RATING",
+                "NET_RATING",
+                "PACE",
+                "TS_PCT",
+            ]
+        ]
+    except Exception:
+        # Fallback por si estamos en transición de temporada
+        stats = leaguedashteamstats.LeagueDashTeamStats(
+            measure_type_detailed_defense="Advanced",
+            per_mode_detailed="PerGame",
+            season="2025-26",
+        )
+        df = stats.get_data_frames()[0]
+        return df[
+            [
+                "TEAM_ID",
+                "TEAM_NAME",
+                "GP",
+                "W",
+                "L",
+                "OFF_RATING",
+                "DEF_RATING",
+                "NET_RATING",
+                "PACE",
+                "TS_PCT",
+            ]
+        ]
+
+
+@st.cache_data(ttl=3600)
+def obtener_metricas_jugadores():
+    try:
+        stats = leaguedashplayerstats.LeagueDashPlayerStats(
+            per_mode_detailed="PerGame", season="2026-27"
+        )
+        df = stats.get_data_frames()[0]
+        if df.empty:
+            raise ValueError("Empty")
+    except Exception:
+        stats = leaguedashplayerstats.LeagueDashPlayerStats(
+            per_mode_detailed="PerGame", season="2025-26"
+        )
+        df = stats.get_data_frames()[0]
+
+    df["PRA"] = df["PTS"] + df["REB"] + df["AST"]
+    return df[[
+        "PLAYER_ID",
+        "PLAYER_NAME",
+        "TEAM_ABBREVIATION",
+        "GP",
+        "MIN",
+        "PTS",
+        "REB",
+        "AST",
+        "FG3M",
+        "PRA",
+    ]]
+
+
+# ==========================================
+# FUNCIONES MATEMÁTICAS Y DE PROYECCIÓN EN VIVO
+# ==========================================
+
+
+def parsear_minutos_iso(iso_str):
+    """Convierte 'PT24M15.00S' a minutos decimales (24.25)."""
+    if not iso_str or not isinstance(iso_str, str):
+        return 0.0
+    match = re.match(r"PT(\d+)M([\d\.]+)S", iso_str)
+    if match:
+        mins = float(match.group(1))
+        secs = float(match.group(2))
+        return mins + (secs / 60.0)
+    return 0.0
+
+
+def calcular_minutos_transcurridos_juego(period, clock_str):
+    """Calcula cuántos minutos reales de juego han pasado."""
+    if period == 0:
+        return 0.0
+    match = re.match(r"PT(\d+)M([\d\.]+)S", str(clock_str))
+    mins_restantes = 0.0
+    if match:
+        mins_restantes = float(match.group(1)) + (float(match.group(2)) / 60.0)
+
+    if period <= 4:
+        minutos_totales_hasta_periodo = period * 12.0
+        return max(0.1, minutos_totales_hasta_periodo - mins_restantes)
+    else:
+        # Tiempo extra (5 mins por OT)
+        ot_num = period - 4
+        return 48.0 + (ot_num * 5.0) - mins_restantes
+
+
+def evaluar_leg_en_vivo(leg, games_dict):
+    """Evalúa el estado actual y la proyección matemática de una selección (leg) del parlay."""
+    game_id = leg["game_id"]
+    juego = next((g for g in games_dict if g["gameId"] == game_id), None)
+
+    if not juego:
+        return {
+            "actual": 0,
+            "proyeccion": 0,
+            "progreso_pct": 0.0,
+            "estado": "⏳ No encontrado",
+            "prob_vivo": 0.5,
+        }
+
+    status = juego["gameStatus"]  # 1: Programado, 2: En vivo, 3: Finalizado
+    if status == 1:
+        return {
+            "actual": 0,
+            "proyeccion": leg["linea"],
+            "progreso_pct": 0.0,
+            "estado": f"🕒 Inicia {juego['gameStatusText']}",
+            "prob_vivo": 0.5,
+        }
+
+    box = obtener_boxscore_vivo(game_id)
+    if not box:
+        return {
+            "actual": 0,
+            "proyeccion": 0,
+            "progreso_pct": 0.0,
+            "estado": "⚠️ Sin BoxScore",
+            "prob_vivo": 0.5,
+        }
+
+    mins_jugados = calcular_minutos_transcurridos_juego(
+        box["period"], box["gameClock"]
+    )
+    mins_totales_reg = 48.0 if box["period"] <= 4 else 48.0 + (
+        (box["period"] - 4) * 5.0
+    )
+    factor_ritmo = (
+        mins_totales_reg / mins_jugados if status == 2 and mins_jugados > 0 else 1.0
+    )
+
+    tipo = leg["tipo_apuesta"]
+    linea = float(leg["linea"])
+    direccion = leg["direccion"]  # "Over" o "Under"
+
+    valor_actual = 0.0
+
+    # --- EVALUACIÓN DE MERCADOS DE EQUIPO ---
+    if tipo in ["Total Puntos Partido", "Spread (Hándicap)", "Moneyline"]:
+        home_pts = box["homeTeam"]["score"]
+        away_pts = box["awayTeam"]["score"]
+
+        if tipo == "Total Puntos Partido":
+            valor_actual = home_pts + away_pts
+        elif tipo == "Spread (Hándicap)":
+            # Asumimos que leg['objetivo'] es el tricode del equipo elegido
+            if leg["objetivo"] == box["homeTeam"]["teamTricode"]:
+                valor_actual = home_pts - away_pts
+            else:
+                valor_actual = away_pts - home_pts
+        elif tipo == "Moneyline":
+            if leg["objetivo"] == box["homeTeam"]["teamTricode"]:
+                valor_actual = home_pts - away_pts
+            else:
+                valor_actual = away_pts - home_pts
+            linea = 0.5  # Debe ganar por al menos 1 punto
+
+    # --- EVALUACIÓN DE PLAYER PROPS ---
+    else:
+        todos_jugadores = (
+            box["homeTeam"]["players"] + box["awayTeam"]["players"]
+        )
+        jugador = next(
+            (p for p in todos_jugadores if p["name"] == leg["objetivo"]), None
+        )
+
+        if jugador and "statistics" in jugador:
+            st_p = jugador["statistics"]
+            pts = st_p.get("points", 0)
+            reb = st_p.get("reboundsTotal", 0)
+            ast = st_p.get("assists", 0)
+            fg3 = st_p.get("threePointersMade", 0)
+
+            if tipo == "Jugador: Puntos":
+                valor_actual = pts
+            elif tipo == "Jugador: Rebotes":
+                valor_actual = reb
+            elif tipo == "Jugador: Asistencias":
+                valor_actual = ast
+            elif tipo == "Jugador: Triples":
+                valor_actual = fg3
+            elif tipo == "Jugador: PRA (Pts+Reb+Ast)":
+                valor_actual = pts + reb + ast
+
+    # Cálculo de proyección lineal ajustada por ritmo
+    if status == 3:
+        proyeccion = valor_actual
+    else:
+        if tipo in ["Spread (Hándicap)", "Moneyline"]:
+            # El diferencial no escala linealmente de 0, proyectamos margen final
+            margen_por_minuto = valor_actual / max(1.0, mins_jugados)
+            proyeccion = margen_por_minuto * mins_totales_reg
+        else:
+            proyeccion = valor_actual * factor_ritmo
+
+    # Cálculo de porcentaje de barra de progreso
+    if direccion == "Over":
+        progreso_pct = min(100.0, max(0.0, (valor_actual / max(0.1, linea)) * 100))
+        cumplido_actual = valor_actual > linea
+    else:
+        # Para Under, medimos cuánto "colchón" queda antes de pasarse
+        progreso_pct = min(100.0, max(0.0, (valor_actual / max(0.1, linea)) * 100))
+        cumplido_actual = valor_actual < linea
+
+    # Determinar estado visual y probabilidad implícita en vivo
+    if status == 3:
+        if (direccion == "Over" and valor_actual > linea) or (
+            direccion == "Under" and valor_actual < linea
+        ):
+            estado = "✅ GANADA"
+            prob_vivo = 1.0
+        elif valor_actual == linea:
+            estado = "➖ PUSH (Nula)"
+            prob_vivo = 0.5
+        else:
+            estado = "❌ PERDIDA"
+            prob_vivo = 0.0
+    else:
+        if direccion == "Over" and valor_actual > linea:
+            estado = "🔥 CUMPLIDA EN VIVO"
+            prob_vivo = 0.99
+        elif direccion == "Under" and valor_actual >= linea:
+            estado = "💀 ROTA EN VIVO"
+            prob_vivo = 0.01
+        else:
+            # Estimación probabilística usando distribución normal sobre el remanente
+            desv_est = max(2.0, abs(linea) * 0.18 * (1 - (mins_jugados / 48.0)))
+            if direccion == "Over":
+                prob_vivo = 1 - norm.cdf(linea, loc=proyeccion, scale=desv_est)
+                estado = (
+                    "🟢 En ritmo"
+                    if proyeccion >= linea
+                    else "🟡 Lento"
+                )
+            else:
+                prob_vivo = norm.cdf(linea, loc=proyeccion, scale=desv_est)
+                estado = (
+                    "🟢 Controlado"
+                    if proyeccion <= linea
+                    else "🔴 Peligro"
+                )
+
+    return {
+        "actual": round(valor_actual, 1),
+        "proyeccion": round(proyeccion, 1),
+        "progreso_pct": progreso_pct,
+        "estado": estado,
+        "prob_vivo": round(prob_vivo, 3),
+        "reloj": f"Q{box['period']} - {box['gameClock']}" if status == 2 else "FINAL",
+    }
+
+
+# ==========================================
+# INTERFAZ DE USUARIO (STREAMLIT)
+# ==========================================
+
+st.sidebar.title("⚡ NBA Quant Terminal")
+st.sidebar.caption("Motor de Seguimiento & Simulación en Vivo")
+
+if st.sidebar.button("🔄 Forzar Actualización en Vivo", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
+
+juegos_hoy = obtener_pizarra_vivo()
+st.sidebar.metric("Partidos en Cartelera Hoy", len(juegos_hoy))
+
+tab1, tab2, tab3 = st.tabs([
+    "📡 Tracker de Parlays en Vivo",
+    "➕ Cargar Nuevo Parlay",
+    "🧠 Laboratorio Quant (Análisis & EV+)",
+])
+
+# ------------------------------------------
+# TAB 1: TRACKER EN VIVO
+# ------------------------------------------
+with tab1:
+    st.header("Monitor de Progreso en Tiempo Real")
+
+    if not st.session_state.parlays:
+        st.info(
+            "No tienes parlays activos cargados. Ve a la pestaña **'➕ Cargar Nuevo Parlay'** para registrar tu ticket."
+        )
+    else:
+        for idx, parlay in enumerate(st.session_state.parlays):
+            with st.container(border=True):
+                col_h1, col_h2, col_h3, col_h4 = st.columns([3, 1.5, 1.5, 1])
+
+                # Evaluar todas las patas (legs) del parlay
+                resultados_legs = [
+                    evaluar_leg_en_vivo(leg, juegos_hoy) for leg in parlay["legs"]
+                ]
+
+                # Probabilidad conjunta actual (asumiendo independencia base)
+                prob_conjunta = np.prod([r["prob_vivo"] for r in resultados_legs])
+                pago_potencial = parlay["stake"] * parlay["cuota_total"]
+
+                with col_h1:
+                    st.subheader(f"🎫 {parlay['nombre']}")
+                    st.caption(
+                        f"Creado: {parlay['fecha']} | {len(parlay['legs'])} Selecciones"
+                    )
+                with col_h2:
+                    st.metric(
+                        "Stake / Pago Potencial",
+                        f"${parlay['stake']:.2f} ➔ ${pago_potencial:.2f}",
+                        f"Cuota @{parlay['cuota_total']:.2f}",
+                    )
+                with col_h3:
+                    st.metric(
+                        "Prob. Supervivencia Vivo",
+                        f"{prob_conjunta * 100:.1f}%",
+                        delta="Vivo" if prob_conjunta > 0 else "Caído",
+                    )
+                with col_h4:
+                    if st.button("🗑️ Borrar", key=f"del_{idx}"):
+                        st.session_state.parlays.pop(idx)
+                        guardar_parlays(st.session_state.parlays)
+                        st.rerun()
+
+                st.divider()
+
+                # Mostrar detalle de cada selección
+                for leg, res in zip(parlay["legs"], resultados_legs):
+                    c1, c2, c3, c4, c5 = st.columns([2.5, 1.5, 1.5, 2, 1.5])
+                    with c1:
+                        st.markdown(f"**{leg['partido']}**")
+                        st.write(
+                            f"{leg['objetivo']} — `{leg['tipo_apuesta']}` ({leg['direccion']} {leg['linea']})"
+                        )
+                    with c2:
+                        st.metric("Actual vs Línea", f"{res['actual']} / {leg['linea']}")
+                    with c3:
+                        st.metric("Proyección Final", f"{res['proyeccion']}")
+                    with c4:
+                        st.write(f"Progreso ({res['progreso_pct']:.0f}%)")
+                        st.progress(int(res["progreso_pct"]))
+                    with c5:
+                        st.markdown(f"**{res['estado']}**")
+                        st.caption(res.get("reloj", ""))
+
+# ------------------------------------------
+# TAB 2: CARGAR NUEVO PARLAY
+# ------------------------------------------
+with tab2:
+    st.header("Constructor & Registro de Parlay")
+
+    if not juegos_hoy:
+        st.warning(
+            "No se detectaron partidos activos en la API de la NBA para el día de hoy."
+        )
+    else:
+        if "draft_legs" not in st.session_state:
+            st.session_state.draft_legs = []
+
+        opciones_juegos = {
+            f"{g['awayTeam']['teamTricode']} @ {g['homeTeam']['teamTricode']} ({g['gameStatusText']})": g
+            for g in juegos_hoy
+        }
+
+        with st.container(border=True):
+            st.subheader("1. Agregar Selección (Leg) al Ticket")
+            juego_sel_label = st.selectbox(
+                "Selecciona el Partido", list(opciones_juegos.keys())
+            )
+            juego_sel = opciones_juegos[juego_sel_label]
+
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                tipo_apuesta = st.selectbox(
+                    "Mercado",
+                    [
+                        "Moneyline",
+                        "Spread (Hándicap)",
+                        "Total Puntos Partido",
+                        "Jugador: Puntos",
+                        "Jugador: Rebotes",
+                        "Jugador: Asistencias",
+                        "Jugador: Triples",
+                        "Jugador: PRA (Pts+Reb+Ast)",
+                    ],
+                )
+
+            with col_b:
+                if tipo_apuesta in ["Moneyline", "Spread (Hándicap)"]:
+                    objetivo = st.selectbox(
+                        "Equipo",
+                        [
+                            juego_sel["awayTeam"]["teamTricode"],
+                            juego_sel["homeTeam"]["teamTricode"],
+                        ],
+                    )
+                elif tipo_apuesta == "Total Puntos Partido":
+                    objetivo = "Ambos Equipos"
+                else:
+                    # Cargar roster del partido si está disponible, o permitir escribir nombre exacto
+                    box_temp = obtener_boxscore_vivo(juego_sel["gameId"])
+                    jugadores_partido = []
+                    if box_temp:
+                        jugadores_partido = [
+                            p["name"]
+                            for p in (
+                                box_temp["homeTeam"]["players"]
+                                + box_temp["awayTeam"]["players"]
+                            )
+                        ]
+
+                    if jugadores_partido:
+                        objetivo = st.selectbox("Jugador", sorted(jugadores_partido))
+                    else:
+                        objetivo = st.text_input(
+                            "Nombre Exacto del Jugador (ej. Luka Doncic)"
+                        )
+
+            with col_c:
+                if tipo_apuesta == "Moneyline":
+                    direccion = "Over"
+                    linea = 0.5
+                    st.info("Gana el partido directo")
+                else:
+                    sub_c1, sub_c2 = st.columns(2)
+                    with sub_c1:
+                        direccion = st.selectbox("Dirección", ["Over", "Under"])
+                    with sub_c2:
+                        linea = st.number_input(
+                            "Línea", value=20.5, step=0.5, format="%.1f"
+                        )
+
+            if st.button("➕ Añadir Selección al Borrador", type="secondary"):
+                if objetivo:
+                    st.session_state.draft_legs.append({
+                        "game_id": juego_sel["gameId"],
+                        "partido": f"{juego_sel['awayTeam']['teamTricode']} @ {juego_sel['homeTeam']['teamTricode']}",
+                        "tipo_apuesta": tipo_apuesta,
+                        "objetivo": objetivo,
+                        "direccion": direccion,
+                        "linea": linea,
+                    })
+                    st.success(f"Añadido: {objetivo} {tipo_apuesta} {direccion} {linea}")
+
+        # Mostrar borrador y guardar
+        if st.session_state.draft_legs:
+            st.subheader("2. Resumen del Ticket en Construcción")
+            df_draft = pd.DataFrame(st.session_state.draft_legs)
+            st.dataframe(
+                df_draft[["partido", "objetivo", "tipo_apuesta", "direccion", "linea"]],
+                use_container_width=True,
+            )
+
+            col_f1, col_f2, col_f3 = st.columns(3)
+            with col_f1:
+                nombre_parlay = st.text_input(
+                    "Nombre del Parlay",
+                    value=f"Parlay NBA #{len(st.session_state.parlays)+1}",
+                )
+            with col_f2:
+                stake = st.number_input(
+                    "Monto Apostado ($)", min_value=1.0, value=10.0, step=1.0
+                )
+            with col_f3:
+                cuota_total = st.number_input(
+                    "Cuota Total (Decimal)", min_value=1.01, value=3.50, step=0.10
+                )
+
+            c_save, c_clear = st.columns([2, 1])
+            with c_save:
+                if st.button("💾 Guardar y Monitorear Parlay", type="primary", use_container_width=True):
+                    nuevo_parlay = {
+                        "nombre": nombre_parlay,
+                        "fecha": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "stake": stake,
+                        "cuota_total": cuota_total,
+                        "legs": st.session_state.draft_legs,
+                    }
+                    st.session_state.parlays.append(nuevo_parlay)
+                    guardar_parlays(st.session_state.parlays)
+                    st.session_state.draft_legs = []
+                    st.success("¡Parlay guardado! Revisa la pestaña de Tracker en Vivo.")
+                    st.rerun()
+            with c_clear:
+                if st.button("Limpiar Borrador", use_container_width=True):
+                    st.session_state.draft_legs = []
+                    st.rerun()
+
+# ------------------------------------------
+# TAB 3: LABORATORIO QUANT (ANÁLISIS & EV+)
+# ------------------------------------------
+with tab3:
+    st.header("Simulador de Valor Esperado (EV+) y Proyección de Matchups")
+    st.markdown(
+        "Cruce de ritmo de posesión (**Pace**), eficiencia ofensiva/defensiva (**ORtg/DRtg**) y simulación de **Poisson / Monte Carlo** para detectar líneas mal ajustadas por las casas de apuestas."
+    )
+
+    subtab_eq, subtab_jug = st.tabs([
+        "🏟️ Simulador de Partido (Totales & Spread)",
+        "🎯 Buscador de Edge en Player Props",
+    ])
+
+    with subtab_eq:
+        df_teams = obtener_metricas_avanzadas_equipos()
+        if df_teams.empty or not juegos_hoy:
+            st.warning("Datos de equipos o cartelera no disponibles en este momento.")
+        else:
+            opciones_j = {
+                f"{g['awayTeam']['teamCity']} {g['awayTeam']['teamName']} @ {g['homeTeam']['teamCity']} {g['homeTeam']['teamName']}": g
+                for g in juegos_hoy
+            }
+            match_sel_str = st.selectbox("Analizar Enfrentamiento de Hoy", list(opciones_j.keys()))
+            match_data = opciones_j[match_sel_str]
+
+            home_id = match_data["homeTeam"]["teamId"]
+            away_id = match_data["awayTeam"]["teamId"]
+
+            home_stats = df_teams[df_teams["TEAM_ID"] == home_id]
+            away_stats = df_teams[df_teams["TEAM_ID"] == away_id]
+
+            if not home_stats.empty and not away_stats.empty:
+                h_row = home_stats.iloc[0]
+                a_row = away_stats.iloc[0]
+
+                # Modelo de proyección basado en Pace y Ratings Ajustados
+                pace_esperado = (h_row["PACE"] + a_row["PACE"]) / 2.0
+                # Puntos esperados cada 100 posesiones ajustados por defensa rival + ventaja local (+1.8 pts)
+                liga_ortg_avg = df_teams["OFF_RATING"].mean()
+                h_pts_proj = (
+                    (h_row["OFF_RATING"] * a_row["DEF_RATING"] / liga_ortg_avg)
+                    * (pace_esperado / 100.0)
+                ) + 1.8
+                a_pts_proj = (
+                    a_row["OFF_RATING"] * h_row["DEF_RATING"] / liga_ortg_avg
+                ) * (pace_esperado / 100.0)
+
+                total_proj = h_pts_proj + a_pts_proj
+                spread_proj = h_pts_proj - a_pts_proj  # Positivo = gana local
+
+                # Simulación Monte Carlo (10,000 iteraciones)
+                np.random.seed(42)
+                sim_home = np.random.normal(h_pts_proj, 11.5, 10000)
+                sim_away = np.random.normal(a_pts_proj, 11.5, 10000)
+                sim_totales = sim_home + sim_away
+                sim_margenes = sim_home - sim_away
+
+                col_m1, col_m2, col_m3 = st.columns(3)
+                col_m1.metric(
+                    f"Proyección {match_data['awayTeam']['teamTricode']}",
+                    f"{a_pts_proj:.1f} pts",
+                    f"Pace: {a_row['PACE']:.1f}",
+                )
+                col_m2.metric(
+                    f"Proyección {match_data['homeTeam']['teamTricode']}",
+                    f"{h_pts_proj:.1f} pts",
+                    f"Pace: {h_row['PACE']:.1f}",
+                )
+                col_m3.metric(
+                    "Total Proyectado / Spread Local",
+                    f"{total_proj:.1f} pts",
+                    f"{spread_proj:+.1f} pts",
+                )
+
+                st.divider()
+                st.subheader("Calculadora de Edge vs Casa de Apuestas")
+                c_in1, c_in2, c_in3 = st.columns(3)
+                linea_casa_total = c_in1.number_input(
+                    "Línea Total de la Casa", value=round(total_proj * 2) / 2, step=0.5
+                )
+                cuota_casa = c_in2.number_input(
+                    "Cuota Ofrecida (Decimal)", value=1.91, step=0.01
+                )
+                lado_apuesta = c_in3.selectbox("Evaluar Selección", ["Over", "Under"])
+
+                if lado_apuesta == "Over":
+                    prob_real = np.mean(sim_totales > linea_casa_total)
+                else:
+                    prob_real = np.mean(sim_totales < linea_casa_total)
+
+                prob_implicita = 1.0 / cuota_casa
+                ev_pct = ((prob_real * cuota_casa) - 1.0) * 100.0
+
+                r1, r2, r3 = st.columns(3)
+                r1.metric("Probabilidad Modelo (Monte Carlo)", f"{prob_real*100:.1f}%")
+                r2.metric("Probabilidad Implícita Casa", f"{prob_implicita*100:.1f}%")
+                r3.metric(
+                    "Valor Esperado (EV)",
+                    f"{ev_pct:+.2f}%",
+                    delta="APOSTAR (EV+)" if ev_pct > 2.0 else "SIN VALOR",
+                )
+
+                # Gráfico de distribución
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Histogram(
+                        x=sim_totales,
+                        nbinsx=50,
+                        name="Simulación Puntos Totales",
+                        marker_color="#00CC96",
+                        opacity=0.75,
+                    )
+                )
+                fig.add_vline(
+                    x=linea_casa_total,
+                    line_dash="dash",
+                    line_color="red",
+                    annotation_text=f"Línea Casa ({linea_casa_total})",
+                )
+                fig.update_layout(
+                    title="Distribución de Probabilidad (10,000 Simulaciones)",
+                    xaxis_title="Puntos Totales del Partido",
+                    yaxis_title="Frecuencia",
+                    height=350,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+    with subtab_jug:
+        df_players = obtener_metricas_jugadores()
+        if not df_players.empty:
+            st.subheader("Evaluador Estadístico de Props (Distribución de Poisson)")
+            col_p1, col_p2, col_p3, col_p4 = st.columns(4)
+
+            jugador_buscar = col_p1.selectbox(
+                "Selecciona Jugador", sorted(df_players["PLAYER_NAME"].unique())
+            )
+            stat_sel = col_p2.selectbox("Estadística", ["PTS", "REB", "AST", "FG3M", "PRA"])
+            linea_prop = col_p3.number_input("Línea Prop", value=15.5, step=0.5)
+            cuota_prop = col_p4.number_input("Cuota Over", value=1.87, step=0.01)
+
+            row_p = df_players[df_players["PLAYER_NAME"] == jugador_buscar].iloc[0]
+            media_jugador = row_p[stat_sel]
+
+            # Probabilidad de superar la línea usando Poisson (1 - CDF(floor(linea)))
+            prob_over_poisson = 1.0 - poisson.cdf(np.floor(linea_prop), mu=media_jugador)
+            ev_prop = ((prob_over_poisson * cuota_prop) - 1.0) * 100.0
+
+            st.info(
+                f"**{jugador_buscar} ({row_p['TEAM_ABBREVIATION']})** | Promedio Temporada en **{stat_sel}**: `{media_jugador:.1f}` (en {row_p['MIN']:.1f} min/juego)"
+            )
+
+            kp1, kp2, kp3 = st.columns(3)
+            kp1.metric("Probabilidad Over (Poisson)", f"{prob_over_poisson*100:.1f}%")
+            kp2.metric("Probabilidad Implícita", f"{(1/cuota_prop)*100:.1f}%")
+            kp3.metric(
+                "Expected Value (EV)",
+                f"{ev_prop:+.2f}%",
+                delta="EDGE DETECTADO" if ev_prop > 3.0 else "DESCARTAR",
+            )
 
